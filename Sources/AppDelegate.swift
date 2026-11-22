@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // UserDefaults keys
     private let kAutoSwitch = "autoSwitchEnabled"
+    private let kOnTheFly = "onTheFlyEnabled"
     private let kDoubleShift = "doubleRightShiftEnabled"
     private let kOptionSpace = "optionSpaceEnabled"
     private let kSound = "soundEnabled"
@@ -103,6 +104,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         autoItem.state = TypingEngine.shared.isAutoSwitchEnabled ? .on : .off
         menu.addItem(autoItem)
 
+        // Toggle On-The-Fly (Punto-style)
+        let flyItem = NSMenuItem(title: "Переключать на лету (как Punto)", action: #selector(toggleOnTheFly), keyEquivalent: "")
+        flyItem.target = self
+        flyItem.state = TypingEngine.shared.isOnTheFlyEnabled ? .on : .off
+        flyItem.isEnabled = TypingEngine.shared.isAutoSwitchEnabled
+        menu.addItem(flyItem)
+
         // Manual switch hint/action
         let manualItem = NSMenuItem(title: "Исправить слово / выделение (⌥Space)", action: #selector(toggleOptionSpace), keyEquivalent: "")
         manualItem.target = self
@@ -162,6 +170,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         TypingEngine.shared.isAutoSwitchEnabled.toggle()
         UserDefaults.standard.set(TypingEngine.shared.isAutoSwitchEnabled, forKey: kAutoSwitch)
         updateBadge()
+    }
+
+    @objc private func toggleOnTheFly() {
+        TypingEngine.shared.isOnTheFlyEnabled.toggle()
+        UserDefaults.standard.set(TypingEngine.shared.isOnTheFlyEnabled, forKey: kOnTheFly)
     }
 
     @objc private func toggleOptionSpace() {
@@ -235,6 +248,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let ud = UserDefaults.standard
         if ud.object(forKey: kAutoSwitch) != nil {
             TypingEngine.shared.isAutoSwitchEnabled = ud.bool(forKey: kAutoSwitch)
+        }
+        if ud.object(forKey: kOnTheFly) != nil {
+            TypingEngine.shared.isOnTheFlyEnabled = ud.bool(forKey: kOnTheFly)
         }
         if ud.object(forKey: kDoubleShift) != nil {
             TypingEngine.shared.isDoubleRightShiftEnabled = ud.bool(forKey: kDoubleShift)
