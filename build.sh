@@ -44,6 +44,7 @@ swiftc -swift-version 5 -O -target arm64-apple-macosx14.0 \
   "$ROOT/Sources/LayoutManager.swift" \
   "$ROOT/Sources/LanguageDetector.swift" \
   "$ROOT/Sources/TypingEngine.swift" \
+  "$ROOT/Sources/SelfTest.swift" \
   "$ROOT/Sources/AppDelegate.swift" \
   "$ROOT/Sources/main.swift" \
   -framework Cocoa -framework Carbon -framework ApplicationServices \
@@ -61,9 +62,9 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key>
     <string>com.swiftswitch.app</string>
     <key>CFBundleVersion</key>
-    <string>2.0.0</string>
+    <string>2.0.1</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.0.0</string>
+    <string>2.0.1</string>
     <key>CFBundleExecutable</key>
     <string>SwiftSwitch</string>
     <key>CFBundlePackageType</key>

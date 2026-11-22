@@ -126,6 +126,14 @@ final class LanguageDetector {
 
     private init() {}
 
+    /// Pre-warms AppleSpell XPC connection off the main thread so the first keystroke has zero latency.
+    func warmUp() {
+        _ = completionCount("сей", lang: .ru)
+        _ = completionCount("hel", lang: .en)
+        _ = isValidDictionaryWord("привет", lang: .ru)
+        _ = isValidDictionaryWord("hello", lang: .en)
+    }
+
     func addSessionIgnored(_ word: String) {
         sessionIgnored.insert(word.lowercased())
     }

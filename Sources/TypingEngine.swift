@@ -21,6 +21,32 @@ struct AutoSwitchUndo {
     let timestamp: Date
 }
 
+enum SwitchLogger {
+    private static let logPath = "/tmp/swiftswitch.log"
+    private static let queue = DispatchQueue(label: "com.swiftswitch.log", qos: .utility)
+
+    static func log(_ message: String) {
+        queue.async {
+            let ts = ISO8601DateFormatter().string(from: Date())
+            let line = "[\(ts)] \(message)\n"
+            guard let data = line.data(using: .utf8) else { return }
+            let fm = FileManager.default
+            if let attrs = try? fm.attributesOfItem(atPath: logPath),
+               let size = attrs[.size] as? UInt64, size > 64_000 {
+                try? data.write(to: URL(fileURLWithPath: logPath))
+                return
+            }
+            if fm.fileExists(atPath: logPath), let fh = FileHandle(forWritingAtPath: logPath) {
+                fh.seekToEndOfFile()
+                fh.write(data)
+                fh.closeFile()
+            } else {
+                try? data.write(to: URL(fileURLWithPath: logPath))
+            }
+        }
+    }
+}
+
 final class TypingEngine {
     static let shared = TypingEngine()
     static let syntheticTag: Int64 = 0x53575357 // "SWSW"
@@ -37,9 +63,8 @@ final class TypingEngine {
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var isInjecting: Bool = false
-    private var injectingTargetLang: SwitchLang?
     private var pendingKeys: [PendingKeyEvent] = []
-    private let pendingLock = NSLock()
+    private let stateLock = NSLock()
     private let injectQueue = DispatchQueue(label: "com.swiftswitch.inject", qos: .userInteractive)
 
     // Current word buffer
@@ -103,7 +128,13 @@ final class TypingEngine {
     @discardableResult
     func start() -> Bool {
         guard eventTap == nil else { return true }
-        guard AXIsProcessTrusted() else { return false }
+        let axTrusted = AXIsProcessTrusted()
+        let listenOK = CGPreflightListenEventAccess()
+        let postOK = CGPreflightPostEventAccess()
+        guard axTrusted else {
+            SwitchLogger.log("start() skipped: AXTrusted=\(axTrusted) Listen=\(listenOK) Post=\(postOK)")
+            return false
+        }
 
         let mask: CGEventMask =
             (1 << CGEventType.keyDown.rawValue) |
@@ -126,6 +157,7 @@ final class TypingEngine {
             callback: callback,
             userInfo: selfPtr
         ) else {
+            SwitchLogger.log("start() FAILED: CGEvent.tapCreate returned nil (AX=\(axTrusted) Listen=\(listenOK) Post=\(postOK))")
             return false
         }
 
@@ -135,6 +167,7 @@ final class TypingEngine {
             CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
         }
         CGEvent.tapEnable(tap: tap, enable: true)
+        SwitchLogger.log("start() OK: EventTap active (AX=\(axTrusted) Listen=\(listenOK) Post=\(postOK) EN=\(LayoutManager.shared.enSourceID) RU=\(LayoutManager.shared.ruSourceID))")
         return true
     }
 
@@ -163,6 +196,7 @@ final class TypingEngine {
 
     private func handleEvent(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            SwitchLogger.log("EventTap disabled (\(type.rawValue)) — re-enabling")
             if let tap = eventTap {
                 CGEvent.tapEnable(tap: tap, enable: true)
             }
@@ -174,20 +208,23 @@ final class TypingEngine {
             return Unmanaged.passUnretained(event)
         }
 
-        // While we are injecting a replacement (~18ms), queue fast user keystrokes so nothing gets lost or scrambled!
-        if isInjecting {
+        // Atomically check isInjecting and queue fast user keystrokes so nothing gets lost or scrambled
+        stateLock.lock()
+        let currentlyInjecting = isInjecting
+        if currentlyInjecting {
             if type == .keyDown {
                 let flags = event.flags
                 if !flags.contains(.maskCommand) && !flags.contains(.maskControl) && !flags.contains(.maskAlternate) {
                     let kc = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
-                    pendingLock.lock()
                     pendingKeys.append(PendingKeyEvent(keyCode: kc, flags: flags))
-                    pendingLock.unlock()
+                    stateLock.unlock()
                     return nil
                 }
             }
+            stateLock.unlock()
             return Unmanaged.passUnretained(event)
         }
+        stateLock.unlock()
 
         // Never inspect password / secure fields
         if IsSecureEventInputEnabled() {
@@ -236,7 +273,6 @@ final class TypingEngine {
             return Unmanaged.passUnretained(event)
         }
 
-        // Any normal key cancels "right shift alone"
         rightShiftDownAlone = false
 
         let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
@@ -267,6 +303,7 @@ final class TypingEngine {
             if let undo = lastUndo, Date().timeIntervalSince(undo.timestamp) < 6.0 {
                 lastUndo = nil
                 LanguageDetector.shared.addSessionIgnored(undo.original)
+                SwitchLogger.log("UNDO: '\(undo.replaced)' -> '\(undo.original)' (\(undo.originalLang.rawValue))")
                 performUndo(undo)
                 return nil
             }
@@ -308,6 +345,7 @@ final class TypingEngine {
                         convertedWord: convertedWord,
                         currentLang: lang
                     ) {
+                        SwitchLogger.log("BOUNDARY SWITCH: \(lang.rawValue)->\(decision.targetLang.rawValue) len=\(rawWord.count)")
                         lastUndo = AutoSwitchUndo(
                             original: rawWord,
                             replaced: decision.replacement,
@@ -322,7 +360,7 @@ final class TypingEngine {
                             targetLang: decision.targetLang,
                             triggerKeyCode: keyCode
                         )
-                        return nil // consume Space/Return; re-sent after replacement
+                        return nil
                     }
                 }
             } else {
@@ -342,30 +380,31 @@ final class TypingEngine {
 
         // Regular character key
         lastUndo = nil
-        guard let typedChar = extractString(from: event)?.first else {
+        let shifted = flags.contains(.maskShift) || flags.contains(.maskAlphaShift)
+        let extracted = extractString(from: event)?.first
+        let fallbackLang = bufferLang ?? LayoutManager.shared.currentLanguage() ?? .en
+        guard let typedChar = extracted ?? LayoutManager.shared.charForKey(keyCode: keyCode, shifted: shifted, lang: fallbackLang) else {
             return Unmanaged.passUnretained(event)
         }
 
-        // Control chars or neutral separators reset buffer cleanly (so "(ctqxfc" starts clean buffer "ctqxfc")
+        // Control chars or neutral separators reset buffer cleanly
         if typedChar.isNewline || typedChar == "\t" || neutralSeparators.contains(typedChar) {
             buffer.removeAll()
             bufferLang = nil
             return Unmanaged.passUnretained(event)
         }
 
-        // Detect active layout directly from typed character's Unicode script (100% immune to stale TIS cache!)
+        // Detect active layout directly from typed character's Unicode script
         let detectedLang = detectLangFromChar(typedChar)
         let curLang = detectedLang ?? bufferLang ?? LayoutManager.shared.currentLanguage() ?? .en
 
         if bufferLang == nil {
             bufferLang = curLang
         } else if let dl = detectedLang, bufferLang != dl {
-            // User manually switched layout mid-word -> start fresh buffer
             buffer.removeAll()
             bufferLang = dl
         }
 
-        let shifted = flags.contains(.maskShift) || flags.contains(.maskAlphaShift)
         buffer.append(TypedKey(keyCode: keyCode, shifted: shifted, char: typedChar))
 
         if buffer.count > 64 {
@@ -382,8 +421,9 @@ final class TypingEngine {
                 convertedPrefix: convertedPrefix,
                 currentLang: curLang
             ) {
-                let deleteCount = buffer.count - 1 // Current key hasn't been emitted yet!
+                let deleteCount = buffer.count - 1
                 let targetLang = decision.targetLang
+                SwitchLogger.log("ON-THE-FLY SWITCH: \(curLang.rawValue)->\(targetLang.rawValue) del=\(deleteCount) repLen=\(decision.replacement.count)")
 
                 lastUndo = AutoSwitchUndo(
                     original: rawPrefix,
@@ -393,7 +433,6 @@ final class TypingEngine {
                     timestamp: Date()
                 )
 
-                // Update buffer to reflect the converted prefix in targetLang so typing continues seamlessly
                 let convChars = Array(decision.replacement)
                 var newBuf: [TypedKey] = []
                 for (i, k) in buffer.enumerated() where i < convChars.count {
@@ -409,7 +448,7 @@ final class TypingEngine {
                     targetLang: targetLang,
                     triggerKeyCode: nil
                 )
-                return nil // consume triggering keystroke; emitted as part of convertedPrefix!
+                return nil
             }
         }
 
@@ -430,18 +469,20 @@ final class TypingEngine {
     }
 
     private func extractString(from event: CGEvent) -> String? {
+        var chars = [UniChar](repeating: 0, count: 4)
         var length = 0
-        event.keyboardGetUnicodeString(maxStringLength: 0, actualStringLength: &length, unicodeString: nil)
+        event.keyboardGetUnicodeString(maxStringLength: 4, actualStringLength: &length, unicodeString: &chars)
         guard length > 0 else { return nil }
-        var chars = [UniChar](repeating: 0, count: length)
-        event.keyboardGetUnicodeString(maxStringLength: length, actualStringLength: &length, unicodeString: &chars)
         return String(utf16CodeUnits: chars, count: length)
     }
 
     // MARK: - Replacement & Manual Switch
 
     func triggerManualSwitch() {
-        guard !isInjecting else { return }
+        stateLock.lock()
+        let busy = isInjecting
+        stateLock.unlock()
+        guard !busy else { return }
 
         if let selected = getSelectedTextViaAX(), !selected.isEmpty {
             let (converted, targetLang) = LayoutManager.shared.convertSelectedTextAuto(selected)
@@ -482,7 +523,10 @@ final class TypingEngine {
         let savedItems = savePasteboard(pb)
         let beforeCount = pb.changeCount
 
+        stateLock.lock()
         isInjecting = true
+        stateLock.unlock()
+
         injectQueue.async { [weak self] in
             guard let self = self else { return }
             self.postKey(keyCode: 8, flags: .maskCommand) // Cmd+C
@@ -496,17 +540,22 @@ final class TypingEngine {
                     pb.setString(converted, forType: .string)
 
                     self.injectQueue.async {
-                        self.selectLayoutOnMain(targetLang)
+                        self.selectLayoutReliably(targetLang)
                         self.postKey(keyCode: 9, flags: .maskCommand) // Cmd+V
                         usleep(120_000)
                         DispatchQueue.main.async {
                             self.restorePasteboard(pb, items: savedItems)
+                            self.stateLock.lock()
                             self.isInjecting = false
+                            self.stateLock.unlock()
                             self.playFeedbackSound()
                         }
                     }
                 } else {
+                    self.stateLock.lock()
                     self.isInjecting = false
+                    self.stateLock.unlock()
+
                     if !self.lastCompletedBuffer.isEmpty {
                         let wordKeys = self.lastCompletedBuffer
                         let lang = self.lastCompletedLang ?? LayoutManager.shared.currentLanguage() ?? .en
@@ -523,9 +572,10 @@ final class TypingEngine {
                         )
                     } else {
                         let next = (LayoutManager.shared.currentLanguage() ?? .en).opposite
-                        LayoutManager.shared.selectLanguage(next)
-                        self.onLayoutChanged?(next)
-                        self.playFeedbackSound()
+                        self.injectQueue.async {
+                            self.selectLayoutReliably(next)
+                            DispatchQueue.main.async { self.playFeedbackSound() }
+                        }
                     }
                 }
             }
@@ -538,62 +588,67 @@ final class TypingEngine {
         pb.clearContents()
         pb.setString(text, forType: .string)
 
+        stateLock.lock()
         isInjecting = true
+        stateLock.unlock()
+
         injectQueue.async { [weak self] in
             guard let self = self else { return }
-            self.selectLayoutOnMain(targetLang)
+            self.selectLayoutReliably(targetLang)
             self.postKey(keyCode: 9, flags: .maskCommand) // Cmd+V
             usleep(120_000)
             DispatchQueue.main.async {
                 self.restorePasteboard(pb, items: savedItems)
+                self.stateLock.lock()
                 self.isInjecting = false
+                self.stateLock.unlock()
                 self.playFeedbackSound()
             }
         }
     }
 
     private func performAutoReplace(deleteCount: Int, replacement: String, targetLang: SwitchLang, triggerKeyCode: UInt16?) {
+        stateLock.lock()
         isInjecting = true
-        injectingTargetLang = targetLang
+        stateLock.unlock()
+
         injectQueue.async { [weak self] in
             guard let self = self else { return }
+
             for _ in 0..<deleteCount {
                 self.postKey(keyCode: self.kcBackspace, flags: [])
-                usleep(1800)
+                usleep(2500)
             }
 
-            self.selectLayoutOnMain(targetLang)
-            usleep(12_000)
+            self.selectLayoutReliably(targetLang)
+            usleep(8000)
 
             self.postUnicodeString(replacement)
 
             if let trigger = triggerKeyCode {
-                usleep(2000)
+                usleep(2500)
                 self.postKey(keyCode: trigger, flags: [])
             }
 
-            // Drain any fast keystrokes queued during the ~18ms injection, mapped to targetLang!
-            self.drainPendingKeys(in: targetLang)
-
-            usleep(4000)
+            // Atomically drain pending keys and clear isInjecting under stateLock
+            self.drainPendingKeysAndFinish(in: targetLang)
             DispatchQueue.main.async {
-                self.isInjecting = false
-                self.injectingTargetLang = nil
                 self.playFeedbackSound()
             }
         }
     }
 
-    private func drainPendingKeys(in targetLang: SwitchLang) {
+    private func drainPendingKeysAndFinish(in targetLang: SwitchLang) {
         while true {
-            pendingLock.lock()
+            stateLock.lock()
             if pendingKeys.isEmpty {
-                pendingLock.unlock()
-                break
+                isInjecting = false
+                stateLock.unlock()
+                return
             }
             let queued = pendingKeys
             pendingKeys.removeAll()
-            pendingLock.unlock()
+            stateLock.unlock()
 
             for ev in queued {
                 if ev.keyCode == kcSpace || ev.keyCode == kcReturn || ev.keyCode == kcEnter || ev.keyCode == kcTab || ev.keyCode == kcBackspace {
@@ -620,7 +675,7 @@ final class TypingEngine {
                         postKey(keyCode: ev.keyCode, flags: ev.flags)
                     }
                 }
-                usleep(1500)
+                usleep(2000)
             }
         }
     }
@@ -638,42 +693,59 @@ final class TypingEngine {
         )
     }
 
-    private func selectLayoutOnMain(_ lang: SwitchLang) {
+    /// Switches keyboard layout via TIS AND verifies; falls back to macOS Ctrl+Space if TIS didn't switch the active source.
+    private func selectLayoutReliably(_ targetLang: SwitchLang) {
+        var curAfter: SwitchLang? = nil
         DispatchQueue.main.sync {
-            LayoutManager.shared.selectLanguage(lang)
-            self.onLayoutChanged?(lang)
+            _ = LayoutManager.shared.selectLanguage(targetLang)
+            self.onLayoutChanged?(targetLang)
+        }
+        usleep(18_000)
+        DispatchQueue.main.sync {
+            curAfter = LayoutManager.shared.currentLanguage()
+        }
+        if curAfter != targetLang {
+            // macOS background-app TIS quirk fallback: send Ctrl+Space (Symbolic HotKey 60)
+            SwitchLogger.log("TISSelectInputSource did not switch (got \(curAfter?.rawValue ?? "nil")), using Ctrl+Space fallback -> \(targetLang.rawValue)")
+            postKey(keyCode: kcSpace, flags: .maskControl)
+            usleep(25_000)
+            DispatchQueue.main.sync {
+                self.onLayoutChanged?(LayoutManager.shared.currentLanguage() ?? targetLang)
+            }
         }
     }
 
     private func postKey(keyCode: UInt16, flags: CGEventFlags) {
-        let src = CGEventSource(stateID: .hidSystemState)
+        let src = CGEventSource(stateID: .privateState)
         if let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true) {
             down.flags = flags
             down.setIntegerValueField(.eventSourceUserData, value: Self.syntheticTag)
-            down.post(tap: .cgAnnotatedSessionEventTap)
+            down.post(tap: .cghidEventTap)
         }
         if let up = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false) {
             up.flags = flags
             up.setIntegerValueField(.eventSourceUserData, value: Self.syntheticTag)
-            up.post(tap: .cgAnnotatedSessionEventTap)
+            up.post(tap: .cghidEventTap)
         }
     }
 
     private func postUnicodeString(_ text: String) {
-        let src = CGEventSource(stateID: .hidSystemState)
+        let src = CGEventSource(stateID: .privateState)
         for scalar in text.unicodeScalars {
             var utf16 = Array(String(scalar).utf16)
             if let down = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true) {
+                down.flags = []
                 down.setIntegerValueField(.eventSourceUserData, value: Self.syntheticTag)
                 down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
-                down.post(tap: .cgAnnotatedSessionEventTap)
+                down.post(tap: .cghidEventTap)
             }
             if let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) {
+                up.flags = []
                 up.setIntegerValueField(.eventSourceUserData, value: Self.syntheticTag)
                 up.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
-                up.post(tap: .cgAnnotatedSessionEventTap)
+                up.post(tap: .cghidEventTap)
             }
-            usleep(1500)
+            usleep(2000)
         }
     }
 

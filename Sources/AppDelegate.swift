@@ -28,11 +28,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        if AXIsProcessTrusted() {
-            TypingEngine.shared.start()
+        DispatchQueue.global(qos: .utility).async {
+            LanguageDetector.shared.warmUp()
+        }
+
+        if AXIsProcessTrusted() && TypingEngine.shared.start() {
             updateBadge()
         } else {
-            requestAccessibilityPermission()
+            if !AXIsProcessTrusted() {
+                requestAccessibilityPermission()
+            }
             startPermissionWatcher()
             updateBadge()
         }
@@ -58,7 +63,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let current = lang ?? LayoutManager.shared.currentLanguage()
         let code = current?.badge ?? "SW"
 
-        if !AXIsProcessTrusted() {
+        if !AXIsProcessTrusted() || !TypingEngine.shared.isRunning {
             button.title = "⚠ \(code)"
         } else if !TypingEngine.shared.isAutoSwitchEnabled {
             button.title = "(\(code))"
@@ -274,10 +279,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func startPermissionWatcher() {
         permissionTimer?.invalidate()
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] timer in
-            if AXIsProcessTrusted() {
+            if AXIsProcessTrusted() && TypingEngine.shared.start() {
                 timer.invalidate()
                 self?.permissionTimer = nil
-                TypingEngine.shared.start()
+                self?.updateBadge()
+            } else {
                 self?.updateBadge()
             }
         }
